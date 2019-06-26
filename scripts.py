@@ -8,7 +8,7 @@ from ccg_nlpy import local_pipeline
 from cache import SurfaceCache
 from main import ZoeRunner
 from zoe_utils import DataReader
-from zoe_utils import ElmoProcessor
+from zoe_utils import BertProcessor
 from zoe_utils import Sentence
 
 
@@ -282,6 +282,29 @@ def produce_magnitude_vec_file(db_name, out_file):
         w.write(key + " " + val + "\n")
 
 
+def combine_caches():
+    title = {}
+    conn = sqlite3.connect('data/bert_cache_2.db')
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE data (title VARCHAR(256) NOT NULL PRIMARY KEY, value TEXT)")
+    for file_name in os.listdir('/shared/experiments/xyu71/pytorch-pretrained-BERT/examples/wiki_vec_pickle/'):
+        with open("/shared/experiments/xyu71/pytorch-pretrained-BERT/examples/wiki_vec_pickle/" + file_name, "rb") as handle:
+            print(file_name)
+            m = pickle.load(handle)
+            for key in m:
+                if key not in title:
+                    title[key] = True
+                    # print(key, len(m[key]))
+                    cur.execute("INSERT INTO data(title, value) VALUES(?, ?)", [key, str(m[key])])
+        conn.commit()
+
+def create_db_index():
+    db = sqlite3.connect('data/bert_cache.db')
+    cur = db.cursor()
+    cur.execute("CREATE INDEX index_my_table ON data (title)")
+    cur.close()
+    db.commit()
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("[ERROR]: No command given.")
@@ -301,3 +324,7 @@ if __name__ == '__main__':
         produce_surface_cache("data/surface_cache.db", "/Volumes/Storage/Resources/wikilinks/elmo_cache_correct.db")
     if sys.argv[1] == "PRODUCE_VEC":
         produce_magnitude_vec_file("/Volumes/External/elmo_cache_correct.db", "/Volumes/External/elmo_cache.vec")
+
+    if sys.argv[1] == "DB":
+        combine_caches()
+        # create_db_index()

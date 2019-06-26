@@ -1,0 +1,10 @@
+/location/location	/LOC
+/people/*	/PER
+/royalty/noble_rank	/PER
+/music/artist	/PER
+/organization/*	/ORG
+/government/governmental_body	/ORG
+/business/employer	/ORG
+/book/newspaper	/ORG
+/religion/religion	/ORG
+/military/military_combatant	/ORG

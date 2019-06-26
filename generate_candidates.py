@@ -3,15 +3,39 @@ import pickle
 
 sentences = []
 
-class Sentence:
+class Sentence_cands:
+
 	def __init__(self):
 		self.tokens = []
+		self.lower_tokens = []
 		self.predictions = []
+		self.phrase_predictions = []
 		# self.candidates = []
 		self.candidates_by_token = {}
 		self.candidates_form_by_token = {}
 
 		self.gold = []
+
+
+	def generate_phrase_predictions(self):
+		if len(self.predictions) == 0:
+			return
+		start_idx = self.predictions[0][1]
+		last_idx = self.predictions[0][1]
+		# print(self.predictions)
+		for i in range(1, len(self.predictions)):
+			# print(pred)
+			# print(i)
+			pred = self.predictions[i]
+			idx = pred[1]
+			if idx != last_idx + 1:
+				self.phrase_predictions.append((start_idx, last_idx+1))
+				start_idx = idx
+				last_idx = idx
+			else:
+				last_idx = idx
+		self.phrase_predictions.append((start_idx, last_idx+1))
+
 
 	def generate_surface_form_by_token(self, idx):
 		forms = []
@@ -22,6 +46,13 @@ class Sentence:
 		self.candidates_form_by_token[idx] = forms
 
 
+	def union_cands(self):
+		union = set()
+		for pred in self.candidates_by_token:
+			for cand in self.candidates_by_token[pred]:
+				union.add(cand)
+		return union
+
 def LoadWikiTitle():
 	file = open("wiki_data/wiki_title_type.pickle", "rb")
 	# file = open("wiki_title.pickle", "rb")
@@ -29,9 +60,10 @@ def LoadWikiTitle():
 	data = pickle.load(file)
 	return data
 
+
 def ReadData(file):
 	infile = open(file, "r")
-	sen = Sentence()
+	sen = Sentence_cands()
 	lStart = 0
 	label = 'O'
 	token_id = -1
@@ -45,7 +77,7 @@ def ReadData(file):
 					lStart = 0
 					label = 'O'
 				sentences.append(sen)
-				sen = Sentence()
+				sen = Sentence_cands()
 				token_id = -1
 				flag = True
 			continue
@@ -57,6 +89,7 @@ def ReadData(file):
 			if token == "'s":
 				split_sen[2] = 'O'
 			sen.tokens.append(token)
+			sen.lower_tokens.append(token.lower())
 			token_id += 1
 			if split_sen[1] != "O":
 				sen.predictions.append((token, token_id))
@@ -69,7 +102,14 @@ def ReadData(file):
 				if split_sen[2].startswith('B-'):
 					lStart = token_id
 					label = split_sen[2][2:]
-	# for sen in sentences:
+
+					# # TODO: Just for post-processing!
+					# if split_sen[1][2:] != 'O':
+					# 	label = split_sen[1][2:]
+					# else:
+					# 	label = 'O'
+
+# for sen in sentences:
 	# 	for gold in sen.gold:
 	# 		print(' '.join(sen.tokens[gold[0] : gold[1]]), gold[2])
 
@@ -182,11 +222,18 @@ def CalculateCoverage():
 	print("Coverage of gold mentions: ", float(cover)/float(total))
 	return miss
 
+def generate_main(filename):
+	wiki = LoadWikiTitle()
+	ReadData(filename)
+	GenerateCandidate()
+	FilterCandByWiki(wiki)
+	return sentences
+
 def main():
 	wiki = LoadWikiTitle()
 	# prisnt(wiki)
-	# ReadData("CLM_CoNLL.out")
-	ReadData("CLM_On.out")
+	ReadData("CLM_output/CLM_CoNLL_dev.out")
+	# ReadData("CLM_On.out")
 	GenerateCandidate()
 	before_filter = CalculateCoverage()
 	FilterCandByWiki(wiki)

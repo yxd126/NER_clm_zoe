@@ -5,47 +5,56 @@ import os
 import pickle
 import sqlite3
 
-import gensim
 import numpy as np
 import regex
-import tensorflow as tf
-from bilm import dump_bilm_embeddings, dump_bilm_embeddings_inner, initialize_sess
 from flask import g
 from scipy.spatial.distance import cosine
+import numpy
+
+import torch
+from pytorch_pretrained_bert import BertTokenizer, BertModel, BertForMaskedLM
 
 
-class ElmoProcessor:
+class BertProcessor:
 
     RANKED_RETURN_NUM = 20
 
-    def __init__(self, allow_tensorflow):
-        self.datadir = os.path.join('bilm-tf', 'model')
-        self.vocab_file = os.path.join(self.datadir, 'vocab_test.txt')
-        self.options_file = os.path.join(self.datadir, 'elmo_2x4096_512_2048cnn_2xhighway_options.json')
-        self.weight_file = os.path.join(self.datadir, 'elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5')
+    def __init__(self):
         with open('data/sent_example.pickle', 'rb') as handle:
             self.sent_example_map = pickle.load(handle)
         self.target_embedding_map = {}
         self.wikilinks_embedding_map = {}
         self.target_output_embedding_map = {}
         self.wikilinks_output_embedding_map = {}
-        self.allow_tensorflow = allow_tensorflow
         self.stop_sign = "STOP_SIGN_SIGNAL"
-        self.batcher, self.ids_placeholder, self.ops, self.sess = initialize_sess(self.vocab_file, self.options_file, self.weight_file)
         self.db_loaded = False
+        self.load_sqlite_db('data/bert_cache_2.db')
         self.server_mode = False
-        self.word2vec = None
+
+        # Load pre-trained model (weights)
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+        self.model = BertModel.from_pretrained('bert-base-uncased')
+        self.model.eval()
+
+        # If you have a GPU, put everything on cuda
+        self.model.to('cuda')
+
+
 
     def load_sqlite_db(self, path, server_mode=False):
+        print(path)
         if not os.path.isfile(path):
             return False
         self.db_conn = sqlite3.connect(path)
         self.db_path = path
         self.server_mode = server_mode
         self.db_loaded = True
+
         return True
 
     def query_sqlite_db(self, candidates):
+    #     print(self.db_loaded)
         if not self.db_loaded:
             return {}
         if self.server_mode:
@@ -55,10 +64,14 @@ class ElmoProcessor:
             cursor = db.cursor()
         else:
             cursor = self.db_conn.cursor()
+        # print("Connected to DB")
         ret_map = {}
         for candidate in candidates:
-            cursor.execute("SELECT value FROM data WHERE title=?", [candidate])
+            # print(candidate)
+            cursor.execute("SELECT value FROM data WHERE title=?", [candidate.lower()])
+            # print('execution finished')
             result = cursor.fetchone()
+            # print(candidate, result)
             if result is not None:
                 result_str = result[0]
                 assert(result_str[0] == '[')
@@ -66,115 +79,9 @@ class ElmoProcessor:
                 result_str = result_str[1:-1]
                 result_arr = [float(x) for x in result_str.split(",")]
                 ret_map[candidate] = result_arr
+            # print(candidate)
         return ret_map
 
-    def process_batch_continuous(self, sentences):
-        tokenized_context = [sentence.strip().split() for sentence in sentences]
-        freq_map = {}
-
-        for i in range(0, len(tokenized_context)):
-            for j in range(0, len(tokenized_context[i])):
-                key = tokenized_context[i][j]
-                if key in freq_map:
-                    freq_map[key] = freq_map[key] + 1.0
-                else:
-                    freq_map[key] = 1.0
-
-        ret_map = {}
-        for sent_id in range(0, len(sentences)):
-            sentence = ' '.join(tokenized_context[sent_id])
-            tokens = sentence.strip().split()
-            char_ids = self.batcher.batch_sentences([tokens])
-            sent_embedding = self.sess.run(
-                self.ops['lm_embeddings'], feed_dict={self.ids_placeholder: char_ids}
-            )[0]
-            for i in range(0, len(tokenized_context[sent_id])):
-                key = tokenized_context[sent_id][i]
-                concat = np.concatenate([
-                    sent_embedding[0][i],
-                    sent_embedding[1][i],
-                    sent_embedding[2][i]
-                ])
-                if key in ret_map:
-                    ret_map[key] = ret_map[key] + concat
-                else:
-                    ret_map[key] = concat
-                assert(len(ret_map[key]) == 3 * 1024)
-        ret_map_avg = {}
-        for key in ret_map:
-            dividend = freq_map[key]
-            ret_map_avg[key] = list(ret_map[key] / dividend)
-        tf.reset_default_graph()
-        return ret_map_avg
-
-    """
-    @sentences: A list of string
-    """
-    def process_batch(self, sentences):
-        tokenized_context = [sentence.strip().split() for sentence in sentences]
-        freq_map = {}
-
-        for i in range(0, len(tokenized_context)):
-            for j in range(0, len(tokenized_context[i])):
-                key = tokenized_context[i][j]
-                if key in freq_map:
-                    freq_map[key] = freq_map[key] + 1.0
-                else:
-                    freq_map[key] = 1.0
-
-        embedding_map = dump_bilm_embeddings(
-            self.vocab_file, sentences, self.options_file, self.weight_file
-        )
-
-        ret_map = {}
-        for sent_id in range(0, len(sentences)):
-            sent_embedding = embedding_map[sent_id]
-            for i in range(0, len(tokenized_context[sent_id])):
-                key = tokenized_context[sent_id][i]
-                concat = np.concatenate([
-                    sent_embedding[0][i],
-                    sent_embedding[1][i],
-                    sent_embedding[2][i]
-                ])
-                if key in ret_map:
-                    ret_map[key] = ret_map[key] + concat
-                else:
-                    ret_map[key] = concat
-                assert(len(ret_map[key]) == 3 * 1024)
-        ret_map_avg = {}
-        for key in ret_map:
-            dividend = freq_map[key]
-            ret_map_avg[key] = list(ret_map[key] / dividend)
-        tf.reset_default_graph()
-        return ret_map_avg
-
-    def process_single_continuous(self, sentence):
-        tokens = sentence.strip().split()
-        char_ids = self.batcher.batch_sentences([tokens])
-        embedding = self.sess.run(
-            self.ops['lm_embeddings'], feed_dict={self.ids_placeholder: char_ids}
-        )[0]
-        ret_map = {}
-        for i in range(0, len(tokens)):
-            ret_map[tokens[i]] = list(embedding[0][i]) + list(embedding[1][i]) + list(embedding[2][i])
-            assert(len(ret_map[tokens[i]]) == 3 * 1024)
-        return ret_map
-
-    """
-    @sentences: A string
-    """
-    def process_single(self, sentence):
-        tokens = sentence.split()
-        embedding = dump_bilm_embeddings_inner(
-            self.vocab_file, sentence, self.options_file, self.weight_file
-        )
-        assert(len(embedding[0]) == len(tokens))
-        ret_map = {}
-        for i in range(0, len(tokens)):
-            ret_map[tokens[i]] = list(embedding[0][i]) + list(embedding[1][i]) + list(embedding[2][i])
-            assert(len(ret_map[tokens[i]]) == 3 * 1024)
-        tf.reset_default_graph()
-        return ret_map
 
     """
     @vec_a, vec_b: A list of numbers
@@ -203,92 +110,64 @@ class ElmoProcessor:
     """
     def rank_candidates(self, sentence, candidates):
         candidates = [x[0] for x in candidates]
-        target_vec = []
-        if sentence.get_mention_surface() not in self.target_embedding_map and self.allow_tensorflow:
-            target_additional_map = self.process_single_continuous(sentence.get_sent_str())
-            if sentence.get_mention_surface() in target_additional_map:
-                target_vec = target_additional_map[sentence.get_mention_surface()]
-        if sentence.get_mention_surface() in self.target_embedding_map:
-            target_vec = self.target_embedding_map[sentence.get_mention_surface()]
-        sentences_to_process = []
-        if self.db_loaded:
-            wikilinks_embedding_map = self.query_sqlite_db(candidates)
-        else:
-            wikilinks_embedding_map = self.wikilinks_embedding_map
-        for candidate in candidates:
-            if candidate not in self.sent_example_map:
-                continue
-            if candidate in wikilinks_embedding_map:
-                continue
-            example_sentences_str = self.sent_example_map[candidate]
-            example_sentences = example_sentences_str.split("|||")
-            for i in range(0, min(len(example_sentences), 10)):
-                sentences_to_process.append(example_sentences[i])
-        wikilinks_additional_map = {}
-        if len(sentences_to_process) > 0 and self.allow_tensorflow:
-            wikilinks_additional_map = self.process_batch_continuous(sentences_to_process)
-        if len(target_vec) == 0:
-            return [(self.stop_sign, 0.0)]
-        self.target_output_embedding_map[sentence.get_mention_surface()] = target_vec
+        # target_vec = []
+
+        # calculate the bert vector of the mention
+
+        # Tokenized input
+
+        tokenized_text = ['[CLS]'] + sentence.tokens + ['[SEP]']
+        print(tokenized_text)
+        print(sentence.mention_start, sentence.mention_end)
+        tokenized_text[sentence.mention_start+1] = '[MASK]'
+        tokenized_text = tokenized_text[:sentence.mention_start+2] + tokenized_text[sentence.mention_end+1:]
+        tokenized_text = self.tokenizer.tokenize(" ".join(tokenized_text))
+
+        print(tokenized_text)
+
+        masked_index = tokenized_text.index('[MASK]')
+
+        # Convert token to vocabulary indices
+        indexed_tokens = self.tokenizer.convert_tokens_to_ids(tokenized_text)
+        # Define sentence A and B indices associated to 1st and 2nd sentences (see paper)
+        segments_ids = [0] * len(tokenized_text)
+
+        # Convert inputs to PyTorch tensors
+        tokens_tensor = torch.tensor([indexed_tokens])
+        segments_tensors = torch.tensor([segments_ids])
+
+        tokens_tensor = tokens_tensor.to('cuda')
+        segments_tensors = segments_tensors.to('cuda')
+
+        # Predict hidden states features for each layer
+        with torch.no_grad():
+            encoded_layers, _ = self.model(tokens_tensor, segments_tensors)
+        # We have a hidden states for each of the 12 layers in model bert-base-uncased
+        target_vec = numpy.concatenate(
+            [encoded_layers[-1][0][masked_index].cpu().numpy(), encoded_layers[-2][0][masked_index].cpu().numpy(),
+             encoded_layers[-3][0][masked_index].cpu().numpy(), encoded_layers[-4][0][masked_index].cpu().numpy()])
+
+        # print(len(candidates))
+        # print('Getting wiki embedding')
+        wikilinks_embedding_map = self.query_sqlite_db(candidates)
+        # print('Finished')
+
+        # self.target_output_embedding_map[sentence.get_mention_surface()] = target_vec
         results = {}
+        # print(len(candidates))
         for candidate in candidates:
-            wikilinks_vec = []
-            if candidate in wikilinks_embedding_map:
-                wikilinks_vec = wikilinks_embedding_map[candidate]
-            if candidate in wikilinks_additional_map:
-                wikilinks_vec = wikilinks_additional_map[candidate]
-            self.wikilinks_output_embedding_map[candidate] = wikilinks_vec
+            if candidate not in wikilinks_embedding_map:
+                continue
+            # print("Calculate similarity", candidate)
+            wikilinks_vec = wikilinks_embedding_map[candidate]
+            # self.wikilinks_output_embedding_map[candidate] = wikilinks_vec
             if len(wikilinks_vec) > 0:
-                results[candidate] = ElmoProcessor.cosine_helper(target_vec, wikilinks_vec)
+                results[candidate] = BertProcessor.cosine_helper(target_vec, wikilinks_vec)
             else:
                 results[candidate] = 0.0
         sorted_results = sorted(results.items(), key=lambda kv: kv[1], reverse=True)
         return [(x[0], x[1]) for x in sorted_results][:self.RANKED_RETURN_NUM]
 
-    def word2vec_helper(self, input):
-        vec = np.zeros(300)
-        if self.word2vec is None:
-            return None
-        if input in self.word2vec:
-            return self.word2vec[input]
-        if input.lower() in self.word2vec:
-            return self.word2vec[input.lower()]
-        count = 0.0
-        for token in input.split("_"):
-            if token in self.word2vec:
-                vec += self.word2vec[token]
-                count += 1.0
-            elif token.lower() in self.word2vec:
-                vec += self.word2vec[token.lower()]
-                count += 1.0
-        if count == 0.0:
-            return None
-        return vec / count
-
-    def rank_candidates_vec(self, sentence=None, candidates=None):
-        data_path = "data/word2vec/GoogleNews-vectors-negative300.bin"
-        if not os.path.isfile(data_path):
-            return candidates
-        if self.word2vec is None:
-            self.word2vec = gensim.models.KeyedVectors.load_word2vec_format(data_path, binary=True)
-        if sentence is None:
-            return None
-        candidates = [x[0] for x in candidates]
-        target_vec = self.word2vec_helper(sentence.get_mention_surface())
-        if target_vec is None:
-            print(sentence.get_mention_surface() + " not found in word2vec")
-            return [(x, 0.0) for x in candidates]
-        assert(len(target_vec) == 300)
-        results = {}
-        for candidate in candidates:
-            candidate_vec = self.word2vec_helper(candidate)
-            if candidate_vec is None:
-                similarity = 0
-            else:
-                similarity = cosine(target_vec, candidate_vec)
-            results[candidate] = similarity
-        sorted_results = sorted(results.items(), key=lambda kv: kv[1], reverse=True)
-        return [(x[0], x[1]) for x in sorted_results][:self.RANKED_RETURN_NUM]
 
     """
     To save the cache maps generated by the processor instance 
@@ -368,11 +247,11 @@ class InferenceProcessor:
     # P(title|surface) min threshold
     PROB_TRUST_THRESHOLD = 0.5
     # The multiplier of the size of ESA candidates to ELMo candidates
-    ELMO_TO_ESA_MULTIPLIER = 15.0
+    BERT_TO_ESA_MULTIPLIER = 15.0
     # Top N candidates we trust to vote for fine types
     TRUST_CANDIDATE_SIZE = 20
     # A elmo score threshold above which a fine type will be added without voting
-    MIN_ELMO_SCORE_THRESHOLD = 0.65
+    MIN_BERT_SCORE_THRESHOLD = 0.65
     # Voting threshold when title is selected via ESA
     VOTING_THRESHOLD_NORMAL = 0.8
     # Voting threshold when title is selected via P(title|surface)
@@ -388,7 +267,7 @@ class InferenceProcessor:
         self.use_prior = use_prior
         self.use_context = use_context
         if custom_mapping is None:
-            mapping_file_name = "mapping/" + self.mode + ".mapping"
+            mapping_file_name = "mapping/" + self.mode + ".map"
             with open(mapping_file_name) as f:
                 for line in f:
                     line = line.strip()
@@ -482,11 +361,10 @@ class InferenceProcessor:
             converted_type = "/" + t.replace(".", "/")
             if converted_type in self.mapping:
                 mapped_set.add(self.mapping[converted_type])
-        if ("organization.non_profit_organization" in freebase_types) or ("education.academic_institution" in freebase_types):
-            if "/organization/company" in mapped_set:
-                mapped_set.remove("/organization/company")
-        if ("/organization/educational_institution" in mapped_set) and ("/organization/company" in mapped_set):
-            mapped_set.remove("/organization/company")
+            if converted_type.startswith("/people"):
+                mapped_set.add("/PER")
+            if converted_type.startswith("/organization"):
+                mapped_set.add("/ORG")
         if len(mapped_set) == 0 and "EMPTY" in self.mapping and title in self.freebase_map:
             mapped_set.add(self.mapping["EMPTY"])
         return mapped_set
@@ -519,6 +397,7 @@ class InferenceProcessor:
     @type_score: A map of (string: float)
     """
     def get_voted_coarse_type_of_title(self, title, candidates, type_score):
+        print("vote coarse type")
         mapped_set = self.get_mapped_types_of_title(title)
         coarse_freq = {}
         for t in mapped_set:
@@ -530,7 +409,14 @@ class InferenceProcessor:
             else:
                 coarse_freq[key] = 1
         pairs = list(coarse_freq.items())
+
+        # if no coarse type, return O
+        print(pairs)
+        if len(pairs) == 0:
+            return 'O', 0.1
+
         pairs.sort(key=lambda kv: kv[1], reverse=True)
+        print(pairs)
         highest_score = pairs[0][1]
         coarse_type = pairs[0][0]
         duel_titles = set()
@@ -553,7 +439,7 @@ class InferenceProcessor:
             line_group = line.split("\t")
             if line_group[0] == "=" and coarse_type == line_group[1] and line_group[2] in mapped_set:
                 coarse_type = line_group[2]
-        return coarse_type
+        return coarse_type, pairs[0][1]
 
     """
     @titles: A list of string
@@ -574,6 +460,8 @@ class InferenceProcessor:
     @type_scores: A map of (string: float)
     """
     def select_in_order(self, candidates, type_scores):
+        if len(candidates) == 0:
+            return None
         for candidate in candidates:
             if len(self.get_mapped_types_of_title(candidate)) == 0:
                 continue
@@ -584,10 +472,10 @@ class InferenceProcessor:
         return candidates[0]
 
     """
-    Get a type's average ELMo score
+    Get a type's average Bert score
     @candidates: A map of (string: float)
     """
-    def get_elmo_type_scores(self, candidates):
+    def get_bert_type_scores(self, candidates):
         ret_map = {}
         ret_map_freq = {}
         for title in candidates:
@@ -601,6 +489,7 @@ class InferenceProcessor:
                     ret_map_freq[t] = 1.0
         for key in ret_map:
             ret_map[key] = ret_map[key] / ret_map_freq[key]
+            print(ret_map[key])
         return ret_map
 
     """
@@ -608,13 +497,12 @@ class InferenceProcessor:
     @selected: A string of title that is selected as best one
     @candidates: A list of (string: float) pairs
     @elmo_type_score: results from self.get_elmo_type_scores()
-    @from_prior: A bool indicating whether @selected comes from P(title|surface)
     """
-    def get_inferred_types(self, selected, candidates, elmo_type_score, from_prior):
+    def get_inferred_types(self, selected, candidates, bert_type_score):
         if len(self.get_mapped_types_of_title(selected)) == 0:
             return []
         candidates = [x[0] for x in candidates]
-        coarse_type = self.get_voted_coarse_type_of_title(selected, candidates, elmo_type_score)
+        coarse_type = self.get_voted_coarse_type_of_title(selected, candidates, bert_type_score)
         filtered_types = set()
         filtered_types.add(coarse_type)
         for t in self.get_mapped_types_of_title(selected):
@@ -637,13 +525,10 @@ class InferenceProcessor:
                             freq_map[t] = 1
         selected_types = set()
         for key in freq_map:
-            if key in elmo_type_score and elmo_type_score[key] > self.MIN_ELMO_SCORE_THRESHOLD:
+            if key in bert_type_score and bert_type_score[key] > self.MIN_BERT_SCORE_THRESHOLD:
                 selected_types.add(key)
         consider_types = [x[0] for x in freq_map.items()]
         voting_threshold = self.VOTING_THRESHOLD_NORMAL
-        if from_prior:
-            consider_types = filtered_types
-            voting_threshold = self.VOTING_THRESHOLD_PRIOR
 
         selected_types.add(coarse_type)
         for t in consider_types:
@@ -656,8 +541,9 @@ class InferenceProcessor:
             if len(t.split("/")) <= 2:
                 continue
             for compare_type in freq_map:
-                if compare_type in elmo_type_score and t in elmo_type_score:
-                    if compare_type.startswith(coarse_type) and (compare_type not in selected_types) and elmo_type_score[compare_type] > elmo_type_score[t]:
+                if compare_type in bert_type_score and t in bert_type_score:
+                    if compare_type.startswith(coarse_type) and (compare_type not in selected_types) \
+                            and bert_type_score[compare_type] > bert_type_score[t]:
                         to_be_removed_types.add(t)
         final_ret_types = set()
         for t in selected_types:
@@ -680,79 +566,74 @@ class InferenceProcessor:
     """
     Inference utility function which make predictions and set results to the input @sentence
     @sentence: A zoe_utils.Sentence
-    @elmo_candidates: A list of (title, score) pairs
+    @bert_candidates: A list of (title, score) pairs
     @esa_candidates: A list of (title, score) pairs
     @return: None
     """
-    def inference(self, sentence, elmo_candidates, esa_candidates):
-        elmo_titles = [x[0] for x in elmo_candidates]
+    def inference(self, sentence, bert_candidates, esa_candidates):
+        bert_titles = [x[0] for x in bert_candidates]
         esa_titles = [x[0] for x in esa_candidates]
-        elmo_freq = self.compute_set_freq(elmo_titles)
+        bert_freq = self.compute_set_freq(bert_titles)
         esa_freq = self.compute_set_freq(esa_titles)
         type_promotion_score_map = {}
-        for t in elmo_freq:
+        for t in bert_freq:
             esa_freq_t = 0.0
             if t in esa_freq:
                 esa_freq_t = float(esa_freq.get(t))
-            type_promotion_score_map[t] = float(elmo_freq.get(t)) * self.ELMO_TO_ESA_MULTIPLIER / esa_freq_t
+            type_promotion_score_map[t] = float(bert_freq.get(t)) * self.BERT_TO_ESA_MULTIPLIER / esa_freq_t
 
-        selected_title = self.select_in_order(elmo_titles, type_promotion_score_map)
+        selected_title = self.select_in_order(bert_titles, type_promotion_score_map)
+        if selected_title is None:
+            sentence.set_predictions('O', 0.1)
+            return
 
-        prob_title = self.get_prob_title(sentence.get_mention_surface_raw())
-        if not self.use_prior:
-            prob_title = ""
-        from_prior = False
-        if prob_title != "" and len(self.get_mapped_types_of_title(prob_title)) > 0:
-            prob_title_coarse_types = self.get_coarse_types_of_title(prob_title)
-            for t in prob_title_coarse_types:
-                if t in type_promotion_score_map and type_promotion_score_map[t] > 1.0:
-                    selected_title = prob_title
-                    from_prior = True
         # Now we have the most trust-worthy title
-        elmo_score_map = {}
-        for (title, score) in elmo_candidates:
-            elmo_score_map[title] = score
-        if from_prior:
-            elmo_score_map[selected_title] = 1.0
-        elmo_type_score = self.get_elmo_type_scores(elmo_score_map)
-        inferred_types = self.get_inferred_types(selected_title, elmo_candidates, elmo_type_score, from_prior)
-        could_also_be_types = self.get_all_possible_coarse_types(elmo_candidates)
-        final_types = self.get_final_types(set(inferred_types))
-        if len(final_types) == 0 and "EMPTY" in self.mapping:
-            final_types.add(self.mapping["EMPTY"])
-        if not self.do_inference:
-            final_types = self.get_types_of_title(selected_title)
-        if not self.use_context:
-            final_types = self.get_types_of_title(prob_title)
-        # set predictions
-        sentence.set_predictions(final_types)
-        sentence.set_could_also_be_types(could_also_be_types)
-        sentence.set_esa_candidates(esa_titles)
-        sentence.set_elmo_candidates(elmo_titles)
+        bert_score_map = {}
+        for (title, score) in bert_candidates:
+            bert_score_map[title] = score
+        bert_type_score = self.get_bert_type_scores(bert_score_map)
+        # inferred_types = self.get_inferred_types(selected_title, bert_candidates, bert_type_score)
+
+        candidates = [x[0] for x in bert_candidates]
+        coarse_type, score = self.get_voted_coarse_type_of_title(selected_title, candidates, bert_type_score)
+        print("type:", coarse_type)
+        sentence.set_predictions(coarse_type, score)
+        sentence.set_esa_candidates(esa_candidates)
+        sentence.set_bert_candidates(bert_candidates)
         sentence.set_selected_candidate(selected_title)
-        if from_prior:
-            sentence.selected_title = "SURF-" + selected_title
-        else:
-            sentence.selected_title = "ELMO-" + selected_title
+        sentence.selected_title = "bert-" + selected_title
         sentence.set_signature(self.signature())
+
+        # could_also_be_types = self.get_all_possible_coarse_types(bert_candidates)
+        # final_types = self.get_final_types(set(inferred_types))
+        # if len(final_types) == 0 and "EMPTY" in self.mapping:
+        #     final_types.add(self.mapping["EMPTY"])
+        # if not self.do_inference:
+        #     final_types = self.get_types_of_title(selected_title)
+        # if not self.use_context:
+        #     final_types = self.get_types_of_title(prob_title)
+        # # set predictions
+        # sentence.set_predictions(final_types)
+        # sentence.set_could_also_be_types(could_also_be_types)
 
 
 class Sentence:
 
     def __init__(self, tokens, mention_start, mention_end, gold_types=None):
         self.tokens = tokens
-        self.mention_start = int(mention_start)
-        self.mention_end = int(mention_end)
+        self.mention_start = mention_start
+        self.mention_end = mention_end
         self.gold_types = gold_types
         if self.gold_types is None:
             self.gold_types = []
         self.predicted_types = []
         self.could_also_be_types = []
         self.esa_candidate_titles = []
-        self.elmo_candidate_titles = []
+        self.bert_candidate_titles = []
         self.selected_title = ""
         self.selected_candidate = ""
         self.inference_signature = ""
+        self.confidence_score = 0.0
 
     """
     @returns: A string tokenized by "_"
@@ -786,8 +667,9 @@ class Sentence:
             concat = concat[:-1]
         return concat
 
-    def set_predictions(self, predicted_types):
+    def set_predictions(self, predicted_types, score):
         self.predicted_types = predicted_types
+        self.confidence_score = float(score)
 
     def set_could_also_be_types(self, could_also_be_types):
         self.could_also_be_types = list(set(could_also_be_types) - set(self.predicted_types))
@@ -795,8 +677,8 @@ class Sentence:
     def set_esa_candidates(self, esa_candidate_titles):
         self.esa_candidate_titles = esa_candidate_titles
 
-    def set_elmo_candidates(self, elmo_candidate_titles):
-        self.elmo_candidate_titles = elmo_candidate_titles
+    def set_bert_candidates(self, bert_candidate_titles):
+        self.bert_candidate_titles = bert_candidate_titles
 
     def set_selected_candidate(self, selected):
         self.selected_candidate = selected
@@ -810,7 +692,7 @@ class Sentence:
         print("Gold\t: " + str(self.gold_types))
         print("Predicted\t" + str(self.predicted_types))
         print("ESA Candidate Titles: " + str(self.esa_candidate_titles))
-        print("ELMo Candidate Titles: " + str(self.elmo_candidate_titles))
+        print("Bert Candidate Titles: " + str(self.bert_candidate_titles))
         print("Selected Candidate: " + str(self.selected_candidate))
 
 
@@ -916,3 +798,9 @@ class DataReader:
                         break
         if size > 0:
             self.sentences = self.sentences[:size]
+
+
+if __name__ == "__main__":
+
+    processor = InferenceProcessor("ontonotes")
+    print(processor.get_mapped_types_of_title("james_clerk_maxwell"))
